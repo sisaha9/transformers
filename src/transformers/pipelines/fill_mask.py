@@ -90,10 +90,13 @@ class FillMaskPipeline(Pipeline):
         model_outputs["input_ids"] = model_inputs["input_ids"]
         return model_outputs
 
-    def postprocess(self, model_outputs, top_k=5, target_ids=None):
+    def postprocess(self, model_outputs, top_k=5, target_ids=None, prefix_ids=None):
         # Cap top_k if there are targets
         if target_ids is not None and target_ids.shape[0] < top_k:
             top_k = target_ids.shape[0]
+        elif target_ids is None:
+            if prefix_ids is not None and prefix_ids.shape[0] < top_k:
+                top_k = prefix_ids.shape[0]
         input_ids = model_outputs["input_ids"][0]
         outputs = model_outputs["logits"]
 
@@ -107,6 +110,10 @@ class FillMaskPipeline(Pipeline):
             if target_ids is not None:
                 probs = tf.gather_nd(tf.squeeze(probs, 0), target_ids.reshape(-1, 1))
                 probs = tf.expand_dims(probs, 0)
+            else:
+                if prefix_ids is not None:
+                    probs = tf.gather_nd(tf.squeeze(probs, 0), prefix_ids.reshape(-1, 1))
+                    probs = tf.expand_dims(probs, 0)
 
             topk = tf.math.top_k(probs, k=top_k)
             values, predictions = topk.values.numpy(), topk.indices.numpy()
@@ -118,6 +125,9 @@ class FillMaskPipeline(Pipeline):
             probs = logits.softmax(dim=-1)
             if target_ids is not None:
                 probs = probs[..., target_ids]
+            else:
+                if prefix_ids is not None:
+                    probs = probs[..., prefix_ids]
 
             values, predictions = probs.topk(top_k)
 
@@ -130,6 +140,9 @@ class FillMaskPipeline(Pipeline):
                 tokens = input_ids.numpy().copy()
                 if target_ids is not None:
                     p = target_ids[p].tolist()
+                else:
+                    if prefix_ids is not None:
+                        p = prefix_ids[p].tolist()
 
                 tokens[masked_index[i]] = p
                 # Filter padding out:
@@ -144,6 +157,46 @@ class FillMaskPipeline(Pipeline):
         if single_mask:
             return result[0]
         return result
+    
+    def get_prefix_ids(self, prefix, top_k=None):
+        try:
+            vocab = self.tokenizer.get_vocab()
+        except Exception:
+            vocab = {}
+        prefix_ids = []
+        key_prefixes = [key for key in vocab.keys() if key.startswith(prefix)]
+        for key_prefix in key_prefixes:
+            id_ = vocab.get(key_prefix, None)
+            if id_ is None:
+                input_ids = self.tokenizer(
+                    key_prefix,
+                    add_special_tokens=False,
+                    return_attention_mask=False,
+                    return_token_type_ids=False,
+                    max_length=1,
+                    truncation=True,
+                )["input_ids"]
+                if len(input_ids) == 0:
+                    logger.warning(
+                        f"The specified prefix token `{key_prefix}` does not exist in the model vocabulary. "
+                        f"We cannot replace it with anything meaningful, ignoring it"
+                    )
+                    continue
+                id_ = input_ids[0]
+                # XXX: If users encounter this pass
+                # it becomes pretty slow, so let's make sure
+                # The warning enables them to fix the input to
+                # get faster performance.
+                logger.warning(
+                    f"The specified prefix token `{key_prefix}` does not exist in the model vocabulary. "
+                    f"Replacing with `{self.tokenizer.convert_ids_to_tokens(id_)}`."
+                )
+            prefix_ids.append(id_)
+        prefix_ids = list(set(prefix_ids))
+        if len(prefix_ids) == 0:
+            raise ValueError("At least one prefix must be provided when passed.")
+        prefix_ids = np.array(prefix_ids)
+        return prefix_ids
 
     def get_target_ids(self, targets, top_k=None):
         if isinstance(targets, str):
@@ -186,12 +239,16 @@ class FillMaskPipeline(Pipeline):
         target_ids = np.array(target_ids)
         return target_ids
 
-    def _sanitize_parameters(self, top_k=None, targets=None):
+    def _sanitize_parameters(self, top_k=None, targets=None, prefix=None):
         postprocess_params = {}
 
         if targets is not None:
             target_ids = self.get_target_ids(targets, top_k)
             postprocess_params["target_ids"] = target_ids
+        else:
+            if prefix is not None:
+                prefix_ids = self.get_prefix_ids(prefix, top_k)
+                postprocess_params["prefix_ids"] = prefix_ids
 
         if top_k is not None:
             postprocess_params["top_k"] = top_k
